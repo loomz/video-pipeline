@@ -39,7 +39,7 @@ CONFIG_BAK = PIPELINE_DIR / "config.env.bak"
 DUB_SH = PIPELINE_DIR / "scripts" / "dub.sh"
 OUTPUT_DIR = Path(os.path.expanduser("~/视频/outputs"))
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
-VERSION = "v0926a"   # 页面右上角显示; 每次改前端代码就 bump, 用户强刷后看到新版本号才算加载了新代码
+VERSION = "v1007a"   # 页面右上角显示; 每次改前端代码就 bump, 用户强刷后看到新版本号才算加载了新代码
 TAIL_LINES = 300   # 日志 tail 行数
 CTX_LINES = 50     # 排障上下文取日志行数
 MAX_TASKS = 20
@@ -198,6 +198,13 @@ def gpu_status():
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".webm",
               ".m4v", ".ts", ".wmv", ".mpg", ".mpeg"}
 
+# 音频 → 中文文本
+AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".flac", ".ogg", ".mka", ".webm",
+              ".aac", ".opus", ".mp4", ".m4v"}
+# 与前端下拉框保持一致; 白名单防注入 (只允许这些码传给 audio2text.sh)
+SRC_LANG_WHITELIST = {"en", "zh-cn", "yue", "ko", "ja", "auto"}
+AUDIO2TEXT_SH = PIPELINE_DIR / "scripts" / "audio2text.sh"
+
 
 def browse_dir(path):
     p = Path(os.path.expanduser(path.strip() or "~")).resolve()
@@ -304,6 +311,102 @@ def stop_task(task_name=None):
     return {"ok": True, "term_sent": pids, "still_alive_after_3s": alive}
 
 
+def parse_multipart(raw: bytes, content_type: str) -> dict:
+    """解析 POST body: multipart → {字段名: 值str | {filename, data:bytes}}; 其余按 urlencoded。
+    文件字段保留原始字节 (不解码), 供音频上传用。"""
+    ct = (content_type or "").lower()
+    if not ct.startswith("multipart/form-data"):
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()}
+    from email.parser import BytesParser
+    from email.policy import default as _ep
+    msg = BytesParser(policy=_ep).parsebytes(
+        b"Content-Type: " + (content_type or "").encode("latin-1", "replace") + b"\r\n\r\n" + raw)
+    out = {}
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name is None:
+            continue
+        filename = part.get_param("filename", header="content-disposition")
+        payload = part.get_payload(decode=True) or b""
+        if filename is not None:
+            out[name] = {"filename": filename, "data": payload}
+        else:
+            out[name] = payload.decode("utf-8", "replace")
+    return out
+
+
+def srt_to_text(path):
+    """去掉 srt 序号行 + 时间戳行, 拼纯文本"""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if not s or re.fullmatch(r"\d+", s) or "-->" in s:
+            continue
+        out.append(s)
+    return "\n".join(out)
+
+
+def submit_audio_translate(filename, ext, src_lang, data: bytes) -> dict:
+    ext = (ext or "").lower()
+    if ext not in AUDIO_EXTS:
+        return {"ok": False, "error": f"不支持的音频类型: {ext or '(未知)'}"}
+    if src_lang not in SRC_LANG_WHITELIST:
+        return {"ok": False, "error": f"未知源语言: {src_lang}"}
+    if not data:
+        return {"ok": False, "error": "上传文件为空 (0 字节)"}
+    if not AUDIO2TEXT_SH.is_file():
+        return {"ok": False, "error": f"找不到 {AUDIO2TEXT_SH.name}"}
+    # 任务目录名只用安全字符 (点/空格等折成 _, 去掉首尾), 保证能过 _safe_name 且不含 ".."
+    safe_stem = re.sub(r"[^A-Za-z0-9-]+", "_", (filename or "audio")).strip("_") or "audio"
+    task = f"aud_{time.strftime('%Y%m%d-%H%M%S')}_{safe_stem}"
+    d = OUTPUT_DIR / task
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        audio = d / f"audio{ext}"
+        audio.write_bytes(data)
+    except OSError as e:
+        return {"ok": False, "error": f"保存上传文件失败: {e}"}
+    # 后台起 audio2text.sh (GPU 由脚本内部 wait_gpu_free 排队, 失败写 translate.status=failed)
+    try:
+        with open(d / "translate.log", "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                ["bash", str(AUDIO2TEXT_SH), str(d), str(audio), src_lang],
+                stdout=lf, stderr=subprocess.STDOUT,
+                start_new_session=True, cwd=str(PIPELINE_DIR))
+    except OSError as e:
+        return {"ok": False, "error": f"启动失败: {e}"}
+    return {"ok": True, "task": task, "file": filename, "source_lang": src_lang, "pid": proc.pid}
+
+
+def poll_audio_translate(task_name) -> dict:
+    if not _safe_name(task_name):
+        return {"error": "bad task name"}
+    d = OUTPUT_DIR / task_name
+    if not d.is_dir():
+        return {"error": f"任务目录不存在: {task_name}"}
+    stf = d / "translate.status"
+    status = stf.read_text(encoding="utf-8").strip() if stf.is_file() else "running"
+    if status not in ("done", "failed"):
+        status = "running"
+    log_tail = []
+    logf = d / "translate.log"
+    if logf.is_file():
+        try:
+            log_tail = logf.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+        except OSError:
+            pass
+    return {
+        "status": status,
+        "en_text": srt_to_text(d / "en.srt") if (d / "en.srt").is_file() else "",
+        "zh_text": srt_to_text(d / "zh-cn.srt") if (d / "zh-cn.srt").is_file() else "",
+        "log_tail": log_tail,
+    }
+
+
 def troubleshoot_context(task_name):
     d = OUTPUT_DIR / task_name
     logf = d / "pipeline.log"
@@ -383,6 +486,22 @@ a{color:#58a6ff;text-decoration:none}
 .empty{color:#5c6773;padding:20px;text-align:center}
 .brow{padding:4px 16px;cursor:pointer;border-radius:4px;margin:1px 8px}
 .brow:hover{background:#21262d}
+/* ---- 音频 → 中文文本 ---- */
+#audioSec h2{font-size:15px;margin:22px 0 8px;color:#8b96a3;font-weight:normal}
+form#audio{background:#161b22;border:1px solid #262d37;border-radius:8px;padding:12px 14px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+form#audio label{font-size:12px;color:#8b96a3;display:block;margin-bottom:3px}
+form#audio input[type=file]{font-size:12px;color:#d5dbe3;background:#0d1117;border:1px solid #2c3542;border-radius:6px;padding:6px 8px;max-width:320px}
+form#audio #audMsg{width:100%;margin:0;font-size:12px}
+form#audio #audMsg.err{color:#f85149}form#audio #audMsg.ok{color:#7ec699}
+.ajob{background:#161b22;border:1px solid #262d37;border-radius:8px;padding:10px 14px;margin-bottom:10px}
+.ajob .ahdr{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.ajob .ahdr b{font-size:13px}
+.ajob .apair{border-left:3px solid #388bfd55;margin-top:10px;padding:2px 0 2px 12px}
+.ajob .apair .atext{margin-top:4px}
+.ajob .atag{font-weight:600;color:#58a6ff}
+.ajob .atext{background:#0d1117;border:1px solid #262d37;border-radius:6px;padding:8px 10px;margin-top:8px;white-space:pre-wrap;word-break:break-word;font-size:13px;max-height:280px;overflow:auto}
+.ajob .atitle{font-size:11px;color:#8b96a3;margin:8px 0 2px;display:flex;gap:8px;align-items:center}
+.ajob .alog{background:#0d1117;border:1px solid #262d37;border-radius:6px;padding:8px 10px;margin-top:8px;white-space:pre-wrap;word-break:break-all;font:11px/1.5 ui-monospace,monospace;color:#8b96a3;max-height:200px;overflow:auto}
 </style>
 </head>
 <body>
@@ -406,6 +525,25 @@ a{color:#58a6ff;text-decoration:none}
 <thead><tr><th>任务</th><th>状态</th><th>进度</th><th>当前阶段</th><th>最新日志</th><th>操作</th></tr></thead>
 <tbody id="rows"><tr><td colspan=6 class="empty">加载中…</td></tr></tbody>
 </table>
+<div id="audioSec">
+  <h2>音频 → 中文文本（只转录+翻译, 不合成视频）</h2>
+  <form id="audio">
+    <div><label>音频文件</label><input type="file" id="audFile" accept=".m4a,.mp3,.wav,.flac,.ogg,.mka,.webm,.aac,.opus,.mp4,.m4v"></div>
+    <div><label>源语言</label>
+      <select id="audLang">
+        <option value="en">英文</option>
+        <option value="zh-cn">中文</option>
+        <option value="yue">粤语</option>
+        <option value="ko">韩语</option>
+        <option value="ja">日语</option>
+        <option value="auto">自动识别</option>
+      </select>
+    </div>
+    <div><button id="audBtn" type="submit">转录并翻译</button></div>
+    <p id="audMsg"></p>
+  </form>
+  <div id="audioJobs"></div>
+</div>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -511,7 +649,83 @@ async function unloadModel(){
   alert(r.ok?`已卸载 ${r.model}:\n${r.response||'(无响应体)'}`:`卸载失败:\n${r.error||''}`);
   refresh();
 }
-refresh(); setInterval(refresh,5000);
+// ---- 音频 → 中文文本 ----
+const escA=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let audioJobs=[];
+try{ audioJobs=JSON.parse(localStorage.getItem('vp_audio_jobs')||'[]'); }catch(_){ audioJobs=[]; }
+function saveAudioJobs(){ try{ localStorage.setItem('vp_audio_jobs',JSON.stringify(audioJobs.slice(0,50))); }catch(_){} }
+function dl(name,text,ext){
+  const b=new Blob([text],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=name+'.'+ext;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+}
+function copyTxt(btn,text){
+  navigator.clipboard.writeText(text).then(()=>{ const o=btn.textContent; btn.textContent='已复制 ✓'; setTimeout(()=>btn.textContent=o,1500); }).catch(()=>{});
+}
+function renderAudioJobs(){
+  const box=$('#audioJobs');
+  if(!box) return;
+  if(!audioJobs.length){ box.innerHTML=''; return; }
+  window.__aj=window.__aj||{};
+  box.innerHTML=audioJobs.map(j=>{
+    const st=j.status||'running';
+    const stTxt={running:'进行中',done:'完成',failed:'失败'}[st]||st;
+    const cls=st==='done'?'done':st==='failed'?'failed':'running';
+    const K=`window.__aj['${escA(j.task)}']`;
+    const LANG_LBL={en:'英文','zh-cn':'中文',yue:'粤语',ko:'韩语',ja:'日语',auto:'自动识别'};
+    const langName=LANG_LBL[j.lang]||j.lang;
+    let body='';
+    if(st==='done'){
+      window.__aj[j.task]={en:j.en_text||'',zh:j.zh_text||'',file:j.file};
+      body=`<div class="apair">
+        <div class="atitle"><span class="atag">${langName}原文</span>
+          <button class="ghost" type="button" onclick="copyTxt(this,${K}.en)">复制</button>
+          <button class="ghost" type="button" onclick="dl(${K}.file,${K}.en,'src-${j.lang}')">下载</button></div>
+        <div class="atext">${escA(j.en_text)}</div>
+        <div class="atitle"><span class="atag">中文译文</span>
+          <button class="ghost" type="button" onclick="copyTxt(this,${K}.zh)">复制</button>
+          <button class="ghost" type="button" onclick="dl(${K}.file,${K}.zh,'zh-cn')">下载</button></div>
+        <div class="atext">${escA(j.zh_text)}</div></div>`;
+    } else if(st==='failed'){
+      body=`<div class="atitle">失败</div><div class="alog">${escA(j.log||'(无日志)')}</div>`;
+    } else {
+      body=`<div class="atitle" style="color:#8b96a3">处理中…（等 GPU → ASR 转录 → LLM 翻译, 5s 自动刷新）</div>`;
+    }
+    return `<div class="ajob"><div class="ahdr"><b>${escA(j.file)}</b><span class="st ${cls}">${stTxt}</span><span style="color:#5c6773;font-size:12px">源: ${escA(langName)}</span></div>${body}</div>`;
+  }).join('');
+}
+$('#audio').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const msg=$('#audMsg'), f=$('#audFile');
+  if(!f.files.length){ msg.className='err'; msg.textContent='请先选择一个音频文件'; return; }
+  const fd=new FormData(); fd.append('file',f.files[0]); fd.append('source_lang',$('#audLang').value);
+  const btn=$('#audBtn'); btn.disabled=true; msg.className=''; msg.textContent='上传并启动中…';
+  let r; try{ r=await (await fetch('/api/translate-audio',{method:'POST',body:fd})).json(); }
+  catch(err){ r={ok:false,error:String(err)}; }
+  btn.disabled=false;
+  if(r.ok){
+    audioJobs.unshift({task:r.task,file:r.file,lang:r.source_lang,status:'running'});
+    saveAudioJobs(); renderAudioJobs();
+    msg.className='ok'; msg.textContent=`已启动 ${r.task} (pid ${r.pid}), 结果见下方列表`;
+    f.value='';
+  } else { msg.className='err'; msg.textContent=r.error||'启动失败'; }
+});
+async function pollAudioJobs(){
+  const pending=audioJobs.filter(j=>j.status!=='done'&&j.status!=='failed');
+  if(!pending.length) return;
+  let changed=false;
+  for(const j of pending){
+    let r; try{ r=await (await fetch('/api/translate-status?task='+encodeURIComponent(j.task))).json(); }catch(_){ continue; }
+    if(r.error) continue;
+    j.status=r.status;
+    if(r.status==='done'){ j.en_text=r.en_text; j.zh_text=r.zh_text; changed=true; }
+    else if(r.status==='failed'){ j.log=(r.log_tail||[]).join('\\n'); changed=true; }
+  }
+  if(changed){ saveAudioJobs(); renderAudioJobs(); }
+}
+renderAudioJobs();
+refresh(); setInterval(()=>{ refresh(); pollAudioJobs(); },5000);
 </script>
 <div id="browseMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:10" onclick="if(event.target===this)closeBrowse()">
   <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(700px,92vw);max-height:80vh;background:#161b22;border:1px solid #2c3542;border-radius:10px;display:flex;flex-direction:column">
@@ -727,6 +941,10 @@ class Handler(BaseHTTPRequestHandler):
                             "error": e.read().decode("utf-8", "replace")[:300]})
             except Exception as e:
                 self._json({"ok": False, "model": model, "error": str(e)})
+        elif path == "/api/translate-status":
+            q = urllib.parse.parse_qs(u.query)
+            name = self._utf8((q.get("task") or [""])[0])
+            self._json(poll_audio_translate(name))
         elif path == "/api/log":
             q = urllib.parse.parse_qs(u.query)
             name = self._utf8((q.get("task") or [""])[0])
@@ -771,6 +989,19 @@ class Handler(BaseHTTPRequestHandler):
             q = _parse_post_body(raw, self.headers.get("Content-Type", ""))
             name = q.get("task") or None
             self._json(stop_task(name))
+        elif u.path == "/api/translate-audio":
+            form = parse_multipart(raw, self.headers.get("Content-Type", ""))
+            fpart = form.get("file")
+            src_lang = form.get("source_lang", "en") if isinstance(form.get("source_lang"), str) else "en"
+            if not isinstance(fpart, dict) or not fpart.get("data"):
+                self._json({"ok": False, "error": "未收到音频文件 (file 字段为空)"}, 400)
+                return
+            fname = fpart.get("filename") or "audio"
+            ext = os.path.splitext(fname)[1].lower() or ".m4a"
+            r = submit_audio_translate(fname, ext, src_lang, fpart["data"])
+            print(f"[api/translate-audio] file={fname!r} ext={ext} lang={src_lang} "
+                  f"ok={r.get('ok')} task={r.get('task','')} size={len(fpart['data'])}", flush=True)
+            self._json(r, 200 if r.get("ok") else 400)
         else:
             self._send(404, "not found", "text/plain")
 
